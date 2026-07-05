@@ -94,11 +94,18 @@ def find_relevant_markets(keywords=None, scan_limit=500, force_refresh=False):
             except (json.JSONDecodeError, TypeError):
                 continue
 
-            if "Yes" in outcomes:
-                yes_price = float(prices[outcomes.index("Yes")])
-            elif prices:
-                yes_price = float(prices[0])
-            else:
+            if not outcomes or not prices or len(outcomes) != len(prices):
+                # Malformed or non-standard market (e.g. mismatched arrays,
+                # or a multi-outcome market that isn't simple Yes/No) --
+                # skip it rather than crash the whole scan over one bad entry.
+                continue
+
+            try:
+                if "Yes" in outcomes:
+                    yes_price = float(prices[outcomes.index("Yes")])
+                else:
+                    yes_price = float(prices[0])
+            except (IndexError, ValueError, TypeError):
                 continue
 
             matches.append({
