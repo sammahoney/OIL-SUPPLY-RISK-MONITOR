@@ -9,7 +9,7 @@ from risk import risk_score
 from chokepoints import get_history_table
 from polymarket import find_relevant_markets
 from spr import get_spr_status
-from eurostat_reserves import get_reserves_history, COUNTRIES as EUROSTAT_COUNTRIES
+from eurostat_reserves import get_reserves_history, get_jet_fuel_history, COUNTRIES as EUROSTAT_COUNTRIES
 
 st.set_page_config(page_title="Oil Supply Risk Monitor", layout="wide")
 
@@ -56,6 +56,11 @@ def get_cached_spr():
 @st.cache_data(ttl=3600 * 12)
 def get_cached_reserves():
     return get_reserves_history(months=9)
+
+
+@st.cache_data(ttl=3600 * 12)
+def get_cached_jet_fuel():
+    return get_jet_fuel_history(months=9)
 
 
 breakdown = get_cached_breakdown()
@@ -163,32 +168,29 @@ with row2_col1:
 
 with row2_col2:
     with st.container(border=True):
-        st.subheader("Iran/Gulf Prediction Market Signal (Polymarket, not scored)")
-        polymarket_matches = get_cached_polymarket()
+        st.subheader("EU Jet Fuel Stocks (9 month view)")
+        jet_fuel = get_cached_jet_fuel()
 
-        if not polymarket_matches:
-            st.write("No relevant active Polymarket markets found right now.")
+        if not jet_fuel:
+            st.info(
+                "Not configured yet -- run `python eurostat_reserves.py`, "
+                "check the 'Discovering ... nrg_stk_oilm' output for the "
+                "jet fuel codes, set JET_STK_FLOW_CODE / JET_SIEC_CODE / "
+                "JET_UNIT_CODE in the file, then this chart will populate."
+            )
         else:
-            top = max(polymarket_matches, key=lambda m: m["yes_probability"])
-            st.metric(top["market_question"], f"{top['yes_probability']}%")
-
-            with st.expander("All matching markets"):
-                df_poly = pd.DataFrame(polymarket_matches).sort_values(
-                    "yes_probability", ascending=False
-                )
-                st.dataframe(
-                    df_poly.rename(columns={
-                        "market_question": "Market",
-                        "yes_probability": "Yes %",
-                        "volume_24hr": "24h Volume ($)",
-                        "event_title": "Event",
-                    }),
-                    use_container_width=True,
-                )
-        st.caption(
-            "Source: Polymarket Gamma API. Market-priced probability, "
-            "not a stress score -- kept separate from Risk Score."
-        )
+            frames = []
+            for geo_code, series in jet_fuel.items():
+                s = pd.Series(series, name=COUNTRY_NAMES.get(geo_code, geo_code))
+                frames.append(s)
+            jdf = pd.concat(frames, axis=1)
+            jdf.index = pd.to_datetime(jdf.index)
+            jdf = jdf.sort_index()
+            st.line_chart(jdf)
+            st.caption(
+                "Source: Eurostat (nrg_stk_oilm), kerosene-type jet fuel "
+                "stocks. Monthly data, published with a multi-month lag."
+            )
 
 
 # --- Bottom: main risk summary hero panel ----------------------------------
@@ -248,3 +250,33 @@ with st.expander("Shipping stress breakdown", expanded=True):
         "rate and Suez transit were dropped from this score in the "
         "redesign -- see shipping_stress.py for the current weighting."
     )
+
+st.divider()
+st.subheader("Iran/Gulf Prediction Market Signal (Polymarket, not scored)")
+
+polymarket_matches = get_cached_polymarket()
+
+if not polymarket_matches:
+    st.write("No relevant active Polymarket markets found right now.")
+else:
+    top = max(polymarket_matches, key=lambda m: m["yes_probability"])
+    st.metric(top["market_question"], f"{top['yes_probability']}%")
+
+    with st.expander("All matching markets"):
+        df_poly = pd.DataFrame(polymarket_matches).sort_values(
+            "yes_probability", ascending=False
+        )
+        st.dataframe(
+            df_poly.rename(columns={
+                "market_question": "Market",
+                "yes_probability": "Yes %",
+                "volume_24hr": "24h Volume ($)",
+                "event_title": "Event",
+            }),
+            use_container_width=True,
+        )
+
+st.caption(
+    "Source: Polymarket Gamma API. Market-priced probability, not a "
+    "stress score -- kept separate from Risk Score."
+)
