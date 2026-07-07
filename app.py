@@ -9,6 +9,7 @@ from chokepoints import get_history_table, get_transit_comparison
 from polymarket import find_relevant_markets
 from spr import get_spr_status
 from eurostat_reserves import get_reserves_history, get_jet_fuel_history
+from eurostat_trade import get_import_history, PARTNERS
 from gdelt import get_recent_headlines
 
 st.set_page_config(page_title="Oil Supply Data Monitor", layout="wide")
@@ -88,6 +89,11 @@ def get_cached_reserves():
 @st.cache_data(ttl=3600 * 12)
 def get_cached_jet_fuel():
     return get_jet_fuel_history(months=MONTHS_WINDOW)
+
+
+@st.cache_data(ttl=3600 * 12)
+def get_cached_imports():
+    return get_import_history(months=MONTHS_WINDOW)
 
 
 with button_col:
@@ -317,31 +323,85 @@ with row2_col2:
             )
 
 
-# --- Oil price, last 12 months, no interpretation --------------------------
-with st.container(border=True):
-    st.subheader("WTI Crude Oil Price (12 months)")
-    price_history = get_cached_price_history()
+# --- Row 3: Oil price | EU crude oil imports by source ---------------------
+row3_col1, row3_col2 = st.columns(2)
 
-    if not price_history:
-        st.write("No data available.")
-    else:
-        pdf = pd.DataFrame(price_history)
-        pdf["date"] = pd.to_datetime(pdf["date"])
+with row3_col1:
+    with st.container(border=True):
+        st.subheader("WTI Crude Oil Price (12 months)")
+        price_history = get_cached_price_history()
 
-        # Explicit Altair instead of st.line_chart -- Streamlit's native
-        # line_chart has scroll-to-zoom on by default, which here just
-        # rescales the same already-loaded data with nothing new to show,
-        # a dead-end interaction. Plain alt.Chart has no zoom unless you
-        # add .interactive(), so this avoids it entirely.
-        price_chart = alt.Chart(pdf).mark_line().encode(
-            x=alt.X("date:T", title=None),
-            y=alt.Y("price:Q", title="USD/barrel", scale=alt.Scale(zero=False)),
-            tooltip=["date", "price"],
-        ).properties(height=320)
+        if not price_history:
+            st.write("No data available.")
+        else:
+            pdf = pd.DataFrame(price_history)
+            pdf["date"] = pd.to_datetime(pdf["date"])
 
-        st.altair_chart(price_chart, use_container_width=True)
-        latest = price_history[-1]
-        st.caption(f"Source: EIA (PET.RWTC.D). Latest: ${latest['price']:.2f} on {latest['date']}.")
+            # Explicit Altair instead of st.line_chart -- Streamlit's native
+            # line_chart has scroll-to-zoom on by default, which here just
+            # rescales the same already-loaded data with nothing new to show,
+            # a dead-end interaction. Plain alt.Chart has no zoom unless you
+            # add .interactive(), so this avoids it entirely.
+            price_chart = alt.Chart(pdf).mark_line().encode(
+                x=alt.X("date:T", title=None),
+                y=alt.Y("price:Q", title="USD/barrel", scale=alt.Scale(zero=False)),
+                tooltip=["date", "price"],
+            ).properties(height=320)
+
+            st.altair_chart(price_chart, use_container_width=True)
+            latest = price_history[-1]
+            st.caption(f"Source: EIA (PET.RWTC.D). Latest: ${latest['price']:.2f} on {latest['date']}.")
+
+with row3_col2:
+    with st.container(border=True):
+        st.subheader(f"EU crude oil imports by source ({MONTHS_WINDOW} months)")
+        imports = get_cached_imports()
+
+        if not imports:
+            st.write("No data available.")
+        else:
+            named_codes = [c for c in PARTNERS if c != "TOTAL"]
+
+            rows = []
+            for code, series in imports.items():
+                if code == "TOTAL":
+                    continue
+                label = PARTNERS.get(code, code)
+                for month, value in series.items():
+                    rows.append({"source": label, "date": month, "value": value})
+
+            # "Other sources" = TOTAL minus whatever's covered by the named
+            # countries above, for each month TOTAL has data for. This reads
+            # as "everyone else combined" instead of a much larger absolute
+            # number the person has to mentally subtract from.
+            total_series = imports.get("TOTAL", {})
+            for month, total_value in total_series.items():
+                named_sum = sum(
+                    imports.get(code, {}).get(month, 0) for code in named_codes
+                )
+                rows.append({
+                    "source": "Other sources",
+                    "date": month,
+                    "value": total_value - named_sum,
+                })
+
+            idf = pd.DataFrame(rows)
+            idf["date"] = pd.to_datetime(idf["date"])
+
+            imports_chart = alt.Chart(idf).mark_line().encode(
+                x=alt.X("date:T", title=None),
+                y=alt.Y("value:Q", title="Thousand tonnes/month", scale=alt.Scale(zero=False)),
+                color=alt.Color("source:N", title="Source"),
+                tooltip=["source", "date", "value"],
+            ).properties(height=320)
+
+            st.altair_chart(imports_chart, use_container_width=True)
+            st.caption(
+                "Source: Eurostat (nrg_ti_oilm), crude oil imports by partner "
+                "country. 'Other sources' = EU total imports minus the named "
+                "countries shown here, not a Eurostat category itself. "
+                "Monthly, multi-month publication lag."
+            )
 
 
 # --- News headlines: presented as-is, not scored ---------------------------
