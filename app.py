@@ -7,7 +7,7 @@ import altair as alt
 from oil import get_oil_price_history
 from chokepoints import get_history_table, get_transit_comparison
 from polymarket import find_relevant_markets
-from spr import get_spr_status
+from spr import get_spr_status, get_spr_history
 from eurostat_reserves import get_reserves_history, get_jet_fuel_history
 from eurostat_trade import get_import_history, PARTNERS
 from gdelt import get_recent_headlines
@@ -81,6 +81,11 @@ def get_cached_spr():
     return get_spr_status()
 
 
+@st.cache_data(ttl=3600 * 6)
+def get_cached_spr_history():
+    return get_spr_history(years=3)
+
+
 @st.cache_data(ttl=3600 * 12)
 def get_cached_reserves():
     return get_reserves_history(months=MONTHS_WINDOW)
@@ -119,6 +124,7 @@ if refresh_clicked:
     get_cached_hormuz_history.clear()
     get_cached_hormuz_comparison.clear()
     get_cached_spr.clear()
+    get_cached_spr_history.clear()
     get_cached_reserves.clear()
     get_cached_jet_fuel.clear()
     st.rerun()
@@ -264,40 +270,47 @@ row2_col1, row2_col2 = st.columns(2)
 
 with row2_col1:
     with st.container(border=True):
-        st.subheader("US SPR")
+        st.subheader("US SPR (3 years)")
         spr = get_cached_spr()
+        spr_history = get_cached_spr_history()
 
-        if not spr:
+        if not spr or not spr_history or not spr_history["series"]:
             st.write("No data available.")
         else:
-            util_pct = spr["utilization_pct"]
-            low_pct = spr["all_time_low_pct"]
-            high_pct = spr["all_time_high_pct"]
+            sdf = pd.DataFrame(spr_history["series"])
+            sdf["date"] = pd.to_datetime(sdf["date"])
 
-            # Fixed: bar fill now represents % of total capacity directly,
-            # matching the label text exactly (previously the bar was
-            # rescaled between all-time low/high, which didn't match the
-            # stated percentage -- e.g. 45.6% capacity showed as a ~12%
-            # full bar). Low/high are now tick marks on the same 0-100
-            # scale as the fill, not a separate scale.
-            st.markdown(f"""
-            <div style="font-family:sans-serif;">
-              <div style="position:relative; height:22px; background:#eee; border-radius:11px; margin:10px 0 4px 0;">
-                <div style="position:absolute; left:0; top:0; height:100%; width:{util_pct}%;
-                            background:#2b6cb0; border-radius:11px;"></div>
-                <div style="position:absolute; left:{low_pct}%; top:-4px; height:30px; width:2px; background:#c53030;"></div>
-                <div style="position:absolute; left:{high_pct}%; top:-4px; height:30px; width:2px; background:#2f855a;"></div>
-              </div>
-              <div style="display:flex; justify-content:space-between; font-size:0.8em; color:#888;">
-                <span style="color:#c53030;">All-time low: {spr['all_time_low_million_bbl']}M ({low_pct}%)</span>
-                <span style="color:#2f855a;">All-time high: {spr['all_time_high_million_bbl']}M ({high_pct}%)</span>
-              </div>
-              <div style="text-align:center; font-size:1.15em; font-weight:600; margin-top:8px;">
-                {spr['current_million_bbl']}M bbl -- {util_pct}% of {spr['capacity_million_bbl']}M capacity
-              </div>
-            </div>
-            """, unsafe_allow_html=True)
+            all_time_high = spr_history["all_time_high_million_bbl"]
+            all_time_low = spr_history["all_time_low_million_bbl"]
 
+            level_line = alt.Chart(sdf).mark_line().encode(
+                x=alt.X("date:T", title=None),
+                y=alt.Y("value_million_bbl:Q", title="Million barrels",
+                        scale=alt.Scale(zero=False)),
+                tooltip=["date", "value_million_bbl"],
+            )
+
+            high_df = pd.DataFrame({"y": [all_time_high]})
+            low_df = pd.DataFrame({"y": [all_time_low]})
+            high_line = alt.Chart(high_df).mark_rule(
+                strokeDash=[4, 4], color="#2f855a"
+            ).encode(y="y:Q")
+            low_line = alt.Chart(low_df).mark_rule(
+                strokeDash=[4, 4], color="#c53030"
+            ).encode(y="y:Q")
+
+            st.altair_chart(
+                alt.layer(level_line, high_line, low_line).properties(height=320),
+                use_container_width=True,
+            )
+
+            st.caption(
+                f"Current: {spr['current_million_bbl']}M bbl "
+                f"({spr['utilization_pct']}% of {spr['capacity_million_bbl']}M capacity). "
+                f"Green line: all-time high ({all_time_high}M, Dec 2009 -- back when "
+                f"authorized capacity was also higher, since reduced to today's 714M). "
+                f"Red line: all-time low ({all_time_low}M)."
+            )
             if spr.get("week_over_week_million_bbl") is not None:
                 direction = "up" if spr["week_over_week_million_bbl"] > 0 else "down"
                 st.caption(f"{direction} {abs(spr['week_over_week_million_bbl'])}M bbl vs last week")
