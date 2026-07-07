@@ -9,7 +9,15 @@ BASE_URL = "https://ec.europa.eu/eurostat/api/dissemination/statistics/1.0/data/
 # Countries shown in the comparison chart: Croatia + a handful of EU
 # neighbors, matching the mockup legend (Germany, France, Croatia, Italy,
 # Hungary).
-COUNTRIES = ["DE", "FR", "HR", "IT", "HU"]
+# Trimmed from the full EU27 -- 27 lines in a legend was unreadable
+# regardless of dimming. This set = the 5 majors (DE/FR/IT/ES/PL),
+# the next 5 largest EU economies by GDP (NL/BE/IE/SE/AT), plus Croatia
+# (kept in specifically, not because it's economically "major").
+COUNTRIES = [
+    "DE", "FR", "IT", "ES", "PL",   # majors
+    "NL", "BE", "IE", "SE", "AT",   # next 5 largest
+    "HR",                            # kept in regardless of size
+]
 
 CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".eurostat_cache.json")
 CACHE_HOURS = 24  # monthly data with a multi-month publication lag -- no need to check often
@@ -174,6 +182,18 @@ def get_reserves_history(months: int = 9, force_refresh: bool = False):
     except (KeyError, IndexError, ValueError) as e:
         print("Eurostat: could not parse JSON-stat response ->", e)
         return entry["result"] if entry else None
+
+    # Days-of-cover has a real institutional floor (EU Directive 2009/119/EC
+    # requires ~90 days minimum), so a reading near 0 isn't a real crisis
+    # nobody reported on -- it's almost certainly a missing month that the
+    # API returned as a literal 0 instead of leaving blank. Drop those
+    # points so the chart shows a gap rather than a false plunge to zero.
+    for country, series in result.items():
+        dropped = [month for month, value in series.items() if value is not None and value < 10]
+        for month in dropped:
+            del series[month]
+        if dropped:
+            print(f"Eurostat: dropped {len(dropped)} implausible near-zero reading(s) for {country}: {dropped}")
 
     cache[cache_key] = {"result": result, "fetched_at": datetime.now(timezone.utc).isoformat()}
     _write_cache(cache)

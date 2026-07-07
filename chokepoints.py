@@ -115,15 +115,18 @@ def get_history_table(portname: str, days: int = 90, force_refresh: bool = False
     return records
 
 
-def get_tanker_stress(portname: str, baseline_days: int = 180, force_refresh: bool = False):
+def get_transit_comparison(portname: str, baseline_days: int = 180, force_refresh: bool = False):
     """
     Compares the most recent day's tanker transit count against the
-    trailing average (excluding that most recent day) to get a
-    stress score. Cached on disk for CACHE_HOURS since PortWatch data
-    only updates roughly daily. Falls back to None if data is missing.
+    trailing average (excluding that most recent day). Returns the raw
+    numbers only -- no manufactured 0-100 "stress score", since whether
+    a given % change counts as concerning is a judgment call, not a fact.
+    Cached on disk for CACHE_HOURS since PortWatch data only updates
+    roughly daily. Falls back to None if data is missing.
     """
     cache = _read_cache()
-    entry = cache.get(portname)
+    cache_key = f"{portname}_comparison"
+    entry = cache.get(cache_key)
 
     if not force_refresh and _cache_entry_is_fresh(entry):
         return entry["result"]
@@ -133,7 +136,7 @@ def get_tanker_stress(portname: str, baseline_days: int = 180, force_refresh: bo
 
     if len(records) < 8:
         print(f"PortWatch: not enough data for {portname} ({len(records)} valid days)")
-        result = {"latest": None, "baseline": None, "pct_change": None, "score": None}
+        result = {"latest": None, "baseline": None, "pct_change": None}
     else:
         latest_record = records[-1]
         baseline_records = records[:-1]
@@ -142,22 +145,57 @@ def get_tanker_stress(portname: str, baseline_days: int = 180, force_refresh: bo
         baseline = sum(r["n_tanker"] for r in baseline_records) / len(baseline_records)
 
         if baseline == 0:
-            result = {"latest": latest, "baseline": baseline, "pct_change": None, "score": None}
+            result = {"latest": latest, "baseline": baseline, "pct_change": None}
         else:
             pct_change = ((latest - baseline) / baseline) * 100
-            score = min(100, max(0, -pct_change))  # falling transits = higher stress
             result = {
                 "latest": latest,
                 "latest_date": latest_record.get("date"),
                 "baseline": round(baseline, 1),
                 "pct_change": round(pct_change, 1),
-                "score": round(score, 1),
             }
 
-    cache[portname] = {"result": result, "fetched_at": datetime.now(timezone.utc).isoformat()}
+    cache[cache_key] = {"result": result, "fetched_at": datetime.now(timezone.utc).isoformat()}
     _write_cache(cache)
 
     return result
+
+
+def get_tanker_transit_history(match: str, days: int = 180):
+    """
+    Returns [(date_str, n_tanker), ...] for a chokepoint, matched loosely
+    by name (e.g. match="Suez" or match="Hormuz") so this doesn't break
+    on exact-casing/spelling assumptions. Sorted oldest -> newest.
+    """
+    since = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%d")
+
+    params = {
+        "where": f"portname LIKE '%{match}%' AND date >= DATE '{since}'",
+        "outFields": "date,portname,n_tanker",
+        "orderByFields": "date ASC",
+        "f": "json",
+        "resultRecordCount": 2000,
+    }
+
+    r = requests.get(BASE_URL, params=params, timeout=15)
+    r.raise_for_status()
+    data = r.json()
+
+    if "error" in data:
+        print("PortWatch API error:", data["error"])
+        return []
+
+    results = []
+    for f in data.get("features", []):
+        attrs = f["attributes"]
+        ts_ms = attrs.get("date")
+        n_tanker = attrs.get("n_tanker")
+        if ts_ms is None or n_tanker is None:
+            continue
+        date_str = datetime.utcfromtimestamp(ts_ms / 1000).strftime("%Y-%m-%d")
+        results.append((date_str, n_tanker))
+
+    return results
 
 
 if __name__ == "__main__":
@@ -167,8 +205,8 @@ if __name__ == "__main__":
     print("\n--- Searching for 'Hormuz' ---")
     list_chokepoint_names("Hormuz")
 
-    print("\n--- Suez Canal tanker stress ---")
-    print(get_tanker_stress("Suez Canal"))
+    print("\n--- Suez Canal transit comparison ---")
+    print(get_transit_comparison("Suez Canal"))
 
-    print("\n--- Strait of Hormuz tanker stress ---")
-    print(get_tanker_stress("Strait of Hormuz"))
+    print("\n--- Strait of Hormuz transit comparison ---")
+    print(get_transit_comparison("Strait of Hormuz"))

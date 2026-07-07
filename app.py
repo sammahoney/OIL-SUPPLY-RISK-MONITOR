@@ -3,39 +3,61 @@ load_dotenv()
 
 import streamlit as st
 import pandas as pd
-from shipping_stress import shipping_stress_breakdown, SHIPPING_STRESS_VERSION
-from oil import get_oil_price
-from risk import risk_score
-from chokepoints import get_history_table
+import altair as alt
+from oil import get_oil_price_history
+from chokepoints import get_history_table, get_transit_comparison
 from polymarket import find_relevant_markets
 from spr import get_spr_status
-from eurostat_reserves import get_reserves_history, get_jet_fuel_history, COUNTRIES as EUROSTAT_COUNTRIES
+from eurostat_reserves import get_reserves_history, get_jet_fuel_history
+from gdelt import get_recent_headlines
 
-st.set_page_config(page_title="Oil Supply Risk Monitor", layout="wide")
+st.set_page_config(page_title="Oil Supply Data Monitor", layout="wide")
 
-DAYS_9MO = 270  # fixed window across every historical chart, no selector
+# Streamlit's top header is fixed/absolute by default and can sit on top
+# of content. Collapsing it to zero height keeps it out of the way.
+st.markdown("""
+<style>
+header.stAppHeader {
+    min-height: 0;
+    height: 0;
+    z-index: -1;
+}
+</style>
+""", unsafe_allow_html=True)
+
+MONTHS_WINDOW = 9
+DAYS_WINDOW = MONTHS_WINDOW * 30
 
 COUNTRY_NAMES = {
-    "DE": "Germany", "FR": "France", "HR": "Croatia",
-    "IT": "Italy", "HU": "Hungary",
+    "AT": "Austria", "BE": "Belgium", "BG": "Bulgaria", "HR": "Croatia",
+    "CY": "Cyprus", "CZ": "Czechia", "DK": "Denmark", "EE": "Estonia",
+    "FI": "Finland", "FR": "France", "DE": "Germany", "GR": "Greece",
+    "HU": "Hungary", "IE": "Ireland", "IT": "Italy", "LV": "Latvia",
+    "LT": "Lithuania", "LU": "Luxembourg", "MT": "Malta", "NL": "Netherlands",
+    "PL": "Poland", "PT": "Portugal", "RO": "Romania", "SK": "Slovakia",
+    "SI": "Slovenia", "ES": "Spain", "SE": "Sweden",
 }
 
-st.title("OIL SUPPLY RISK MONITOR")
-st.caption(f"shipping_stress module: {SHIPPING_STRESS_VERSION}")
+# Full opacity by default; everything else sits dimmed until hovered.
+# DE/FR/IT/ES/PL = five largest EU economies. Croatia stays in the data
+# (hoverable like any other country) but isn't emphasized by default.
+MAJOR_COUNTRIES = {"DE", "FR", "IT", "ES", "PL"}
+
+title_col, button_col = st.columns([5, 1])
+with title_col:
+    st.title("OIL SUPPLY DATA MONITOR")
 
 
 # --- Cached fetchers -------------------------------------------------------
-# TTLs match how often each underlying source actually updates -- no point
-# re-checking monthly/weekly sources every 30 minutes.
 
-@st.cache_data(ttl=1800)
-def get_cached_breakdown():
-    return shipping_stress_breakdown()
+@st.cache_data(ttl=3600 * 6)
+def get_cached_price_history():
+    return get_oil_price_history(days=365)
 
 
 @st.cache_data(ttl=1800)
-def get_cached_price():
-    return get_oil_price()
+def get_cached_headlines():
+    return get_recent_headlines(limit=8)
 
 
 @st.cache_data(ttl=1800)
@@ -45,7 +67,12 @@ def get_cached_polymarket():
 
 @st.cache_data(ttl=3600 * 6)
 def get_cached_hormuz_history():
-    return get_history_table("Strait of Hormuz", days=DAYS_9MO)
+    return get_history_table("Strait of Hormuz", days=DAYS_WINDOW)
+
+
+@st.cache_data(ttl=3600 * 6)
+def get_cached_hormuz_comparison():
+    return get_transit_comparison("Strait of Hormuz")
 
 
 @st.cache_data(ttl=3600 * 6)
@@ -55,108 +82,212 @@ def get_cached_spr():
 
 @st.cache_data(ttl=3600 * 12)
 def get_cached_reserves():
-    return get_reserves_history(months=9)
+    return get_reserves_history(months=MONTHS_WINDOW)
 
 
 @st.cache_data(ttl=3600 * 12)
 def get_cached_jet_fuel():
-    return get_jet_fuel_history(months=9)
+    return get_jet_fuel_history(months=MONTHS_WINDOW)
 
 
-breakdown = get_cached_breakdown()
-stress = breakdown["combined"]
-price = get_cached_price()
-risk = risk_score(stress, price)
+with button_col:
+    refresh_clicked = st.button("Force refresh now")
 
-if st.button("Force refresh now"):
-    get_cached_breakdown.clear()
-    get_cached_price.clear()
+if refresh_clicked:
+    # Clearing Streamlit's cache alone isn't enough -- several of these
+    # sources also have their own disk-based cache underneath (see
+    # eurostat_reserves.py, chokepoints.py, spr.py, polymarket.py), which
+    # Streamlit's cache.clear() doesn't touch. Explicitly force-refresh
+    # each disk cache first, then clear Streamlit's cache so the next
+    # render reads the now-fresh disk cache instead of a stale one.
+    get_reserves_history(months=MONTHS_WINDOW, force_refresh=True)
+    get_jet_fuel_history(months=MONTHS_WINDOW, force_refresh=True)
+    get_history_table("Strait of Hormuz", days=DAYS_WINDOW, force_refresh=True)
+    get_transit_comparison("Strait of Hormuz", force_refresh=True)
+    get_spr_status(force_refresh=True)
+    find_relevant_markets(force_refresh=True)
+
+    get_cached_price_history.clear()
+    get_cached_headlines.clear()
     get_cached_polymarket.clear()
     get_cached_hormuz_history.clear()
+    get_cached_hormuz_comparison.clear()
     get_cached_spr.clear()
     get_cached_reserves.clear()
+    get_cached_jet_fuel.clear()
     st.rerun()
 
 
-# --- Row 1: Croatia vs EU reserves | Hormuz tanker transits ----------------
+def build_country_chart(reserves: dict, y_title: str):
+    """
+    Shared chart builder for the reserves and jet fuel panels: one line
+    per EU country, majors (+ Croatia) at full opacity by default, all
+    others dimmed. Hovering a legend entry brings that one country to
+    full opacity and dims everyone else, then reverts to the default
+    major/minor state when the mouse leaves the legend.
+    """
+    rows = []
+    for geo_code, series in reserves.items():
+        country = COUNTRY_NAMES.get(geo_code, geo_code)
+        is_major = geo_code in MAJOR_COUNTRIES
+        for month, value in series.items():
+            rows.append({
+                "country": country,
+                "date": month,
+                "value": value,
+                "is_major": is_major,
+            })
+
+    df = pd.DataFrame(rows)
+    df["date"] = pd.to_datetime(df["date"])
+
+    # Legend order: majors (alphabetical), then Croatia, then everyone
+    # else alphabetical -- so Croatia is easy to find even though it's
+    # not emphasized by default.
+    major_names = sorted(COUNTRY_NAMES[c] for c in MAJOR_COUNTRIES if c in reserves)
+    other_codes = [c for c in reserves if c not in MAJOR_COUNTRIES and c != "HR"]
+    other_names = sorted(COUNTRY_NAMES.get(c, c) for c in other_codes)
+    legend_order = major_names + (["Croatia"] if "HR" in reserves else []) + other_names
+
+    selection = alt.selection_point(
+        fields=["country"], on="mouseover", bind="legend",
+        nearest=False, empty=False, name="hover_select",
+    )
+
+    chart = (
+        alt.Chart(df)
+        .mark_line()
+        .encode(
+            x=alt.X("date:T", title=None),
+            y=alt.Y("value:Q", title=y_title, scale=alt.Scale(zero=False)),
+            color=alt.Color("country:N", title="Country", sort=legend_order),
+            opacity=alt.condition(
+                selection,
+                alt.value(1.0),
+                alt.Opacity("default_opacity:Q", legend=None),
+            ),
+            tooltip=["country", "date", "value"],
+        )
+        .transform_calculate(default_opacity="datum.is_major ? 1.0 : 0.25")
+        .add_params(selection)
+        .properties(height=320)
+    )
+
+    return chart
+
+
 row1_col1, row1_col2 = st.columns(2)
 
 with row1_col1:
     with st.container(border=True):
-        st.subheader("Croatia vs EU oil reserves (9 month view)")
+        st.subheader(f"EU oil reserves, days of cover ({MONTHS_WINDOW} months)")
         reserves = get_cached_reserves()
 
         if not reserves:
             st.info(
-                "Not configured yet -- run `python eurostat_reserves.py` to "
-                "discover the right Eurostat dimension codes, set them in "
-                "the file, then this chart will populate."
+                "Not configured yet -- run `python eurostat_reserves.py` "
+                "first (see file for setup)."
             )
         else:
-            frames = []
-            for geo_code, series in reserves.items():
-                s = pd.Series(series, name=COUNTRY_NAMES.get(geo_code, geo_code))
-                frames.append(s)
-            df = pd.concat(frames, axis=1)
-            df.index = pd.to_datetime(df.index)
-            df = df.sort_index()
-            st.line_chart(df)
+            st.altair_chart(build_country_chart(reserves, "Days of cover"),
+                             use_container_width=True)
             st.caption(
                 "Source: Eurostat (nrg_stk_oem), emergency oil stocks in "
-                "days-equivalent of cover. Monthly data, published with a "
-                "multi-month lag."
+                "days-equivalent of cover. Monthly, multi-month publication "
+                "lag. Hover a country in the legend to isolate it."
             )
 
 with row1_col2:
     with st.container(border=True):
-        st.subheader("Strait of Hormuz tankers (9 month view)")
+        st.subheader(f"Strait of Hormuz tanker transits ({MONTHS_WINDOW} months)")
         hormuz_history = get_cached_hormuz_history()
+        comparison = get_cached_hormuz_comparison()
 
         if not hormuz_history:
             st.write("No data available.")
         else:
             hdf = pd.DataFrame(hormuz_history)
             hdf["date"] = pd.to_datetime(hdf["date"])
-            hdf = hdf.set_index("date").sort_index()
+            hdf = hdf.sort_values("date")
             hdf["n_tanker_7d_avg"] = hdf["n_tanker"].rolling(7, min_periods=1).mean()
-            st.line_chart(hdf[["n_tanker", "n_tanker_7d_avg"]])
-            st.caption(
-                "Source: IMF PortWatch, daily tanker transit counts. "
-                "~7 day publication lag."
+
+            # Reference line: average over the first 60 days of this window,
+            # i.e. the earliest data shown -- a plain "what it looked like
+            # at the start of this chart" marker, not a claim about what's
+            # "normal" or "safe".
+            early_window = hdf.head(60)
+            reference_value = early_window["n_tanker"].mean() if not early_window.empty else None
+
+            base = alt.Chart(hdf).mark_line().encode(
+                x=alt.X("date:T", title=None),
             )
+            tanker_line = base.encode(
+                y=alt.Y("n_tanker:Q", title="Tanker transits/day"),
+                color=alt.value("#1f77b4"),
+            )
+            avg_line = base.encode(
+                y=alt.Y("n_tanker_7d_avg:Q", title="Tanker transits/day"),
+                color=alt.value("#ff7f0e"),
+            )
+            layers = [tanker_line, avg_line]
+
+            if reference_value is not None:
+                ref_df = pd.DataFrame({"y": [reference_value]})
+                ref_line = alt.Chart(ref_df).mark_rule(
+                    strokeDash=[4, 4], color="#888"
+                ).encode(y="y:Q")
+                layers.append(ref_line)
+
+            st.altair_chart(alt.layer(*layers).properties(height=320),
+                             use_container_width=True)
+
+            caption = "Source: IMF PortWatch, daily tanker transit counts. ~7 day publication lag."
+            if reference_value is not None:
+                caption += f" Dashed line: average over the first 60 days shown here ({reference_value:.0f}/day)."
+            st.caption(caption)
+
+            if comparison and comparison.get("pct_change") is not None:
+                st.caption(
+                    f"Most recent day: {comparison['latest']} transits, vs "
+                    f"{comparison['baseline']} trailing 180-day average "
+                    f"({comparison['pct_change']:+.1f}%)."
+                )
 
 
-# --- Row 2: US SPR gauge | Polymarket signal -------------------------------
 row2_col1, row2_col2 = st.columns(2)
 
 with row2_col1:
     with st.container(border=True):
-        st.subheader("US SPR (current)")
+        st.subheader("US SPR")
         spr = get_cached_spr()
 
         if not spr:
             st.write("No data available.")
         else:
+            util_pct = spr["utilization_pct"]
             low_pct = spr["all_time_low_pct"]
             high_pct = spr["all_time_high_pct"]
-            current_pct = spr["utilization_pct"]
-            # position of the current marker along the low->high range, as a %
-            span = high_pct - low_pct
-            marker_pos = ((current_pct - low_pct) / span * 100) if span > 0 else 50
-            marker_pos = max(0, min(100, marker_pos))
 
+            # Fixed: bar fill now represents % of total capacity directly,
+            # matching the label text exactly (previously the bar was
+            # rescaled between all-time low/high, which didn't match the
+            # stated percentage -- e.g. 45.6% capacity showed as a ~12%
+            # full bar). Low/high are now tick marks on the same 0-100
+            # scale as the fill, not a separate scale.
             st.markdown(f"""
             <div style="font-family:sans-serif;">
-              <div style="display:flex; justify-content:space-between; font-size:0.85em; color:#888;">
-                <span>All-Time Low: {spr['all_time_low_million_bbl']}M ({low_pct}%)</span>
-                <span>All-Time High: {spr['all_time_high_million_bbl']}M ({high_pct}%)</span>
+              <div style="position:relative; height:22px; background:#eee; border-radius:11px; margin:10px 0 4px 0;">
+                <div style="position:absolute; left:0; top:0; height:100%; width:{util_pct}%;
+                            background:#2b6cb0; border-radius:11px;"></div>
+                <div style="position:absolute; left:{low_pct}%; top:-4px; height:30px; width:2px; background:#c53030;"></div>
+                <div style="position:absolute; left:{high_pct}%; top:-4px; height:30px; width:2px; background:#2f855a;"></div>
               </div>
-              <div style="position:relative; height:18px; background:#eee; border-radius:9px; margin:6px 0;">
-                <div style="position:absolute; left:0; top:0; height:100%; width:{marker_pos}%;
-                            background:#2b6cb0; border-radius:9px;"></div>
+              <div style="display:flex; justify-content:space-between; font-size:0.8em; color:#888;">
+                <span style="color:#c53030;">All-time low: {spr['all_time_low_million_bbl']}M ({low_pct}%)</span>
+                <span style="color:#2f855a;">All-time high: {spr['all_time_high_million_bbl']}M ({high_pct}%)</span>
               </div>
-              <div style="text-align:center; font-size:1.1em; font-weight:600;">
-                {spr['current_million_bbl']}M bbl ({spr['utilization_pct']}% of {spr['capacity_million_bbl']}M capacity)
+              <div style="text-align:center; font-size:1.15em; font-weight:600; margin-top:8px;">
+                {spr['current_million_bbl']}M bbl -- {util_pct}% of {spr['capacity_million_bbl']}M capacity
               </div>
             </div>
             """, unsafe_allow_html=True)
@@ -168,91 +299,69 @@ with row2_col1:
 
 with row2_col2:
     with st.container(border=True):
-        st.subheader("EU Jet Fuel Stocks (9 month view)")
+        st.subheader(f"EU jet fuel stocks, thousand tonnes ({MONTHS_WINDOW} months)")
         jet_fuel = get_cached_jet_fuel()
 
         if not jet_fuel:
             st.info(
-                "Not configured yet -- run `python eurostat_reserves.py`, "
-                "check the 'Discovering ... nrg_stk_oilm' output for the "
-                "jet fuel codes, set JET_STK_FLOW_CODE / JET_SIEC_CODE / "
-                "JET_UNIT_CODE in the file, then this chart will populate."
+                "Not configured yet -- run `python eurostat_reserves.py` "
+                "and check the jet fuel discovery output (see file)."
             )
         else:
-            frames = []
-            for geo_code, series in jet_fuel.items():
-                s = pd.Series(series, name=COUNTRY_NAMES.get(geo_code, geo_code))
-                frames.append(s)
-            jdf = pd.concat(frames, axis=1)
-            jdf.index = pd.to_datetime(jdf.index)
-            jdf = jdf.sort_index()
-            st.line_chart(jdf)
+            st.altair_chart(build_country_chart(jet_fuel, "Thousand tonnes"),
+                             use_container_width=True)
             st.caption(
-                "Source: Eurostat (nrg_stk_oilm), kerosene-type jet fuel "
-                "stocks. Monthly data, published with a multi-month lag."
+                "Source: Eurostat (nrg_stk_oilm), kerosene-type jet fuel, "
+                "closing stock on national territory. Monthly, multi-month "
+                "publication lag. Hover a country in the legend to isolate it."
             )
 
 
-# --- Bottom: main risk summary hero panel ----------------------------------
-st.divider()
+# --- Oil price, last 12 months, no interpretation --------------------------
+with st.container(border=True):
+    st.subheader("WTI Crude Oil Price (12 months)")
+    price_history = get_cached_price_history()
 
-if risk is None:
-    status_color, status_text = "#666", "NO DATA"
-elif risk > 70:
-    status_color, status_text = "#c53030", "HIGH RISK REGIME"
-elif risk > 40:
-    status_color, status_text = "#b7791f", "ELEVATED RISK"
+    if not price_history:
+        st.write("No data available.")
+    else:
+        pdf = pd.DataFrame(price_history)
+        pdf["date"] = pd.to_datetime(pdf["date"])
+
+        # Explicit Altair instead of st.line_chart -- Streamlit's native
+        # line_chart has scroll-to-zoom on by default, which here just
+        # rescales the same already-loaded data with nothing new to show,
+        # a dead-end interaction. Plain alt.Chart has no zoom unless you
+        # add .interactive(), so this avoids it entirely.
+        price_chart = alt.Chart(pdf).mark_line().encode(
+            x=alt.X("date:T", title=None),
+            y=alt.Y("price:Q", title="USD/barrel", scale=alt.Scale(zero=False)),
+            tooltip=["date", "price"],
+        ).properties(height=320)
+
+        st.altair_chart(price_chart, use_container_width=True)
+        latest = price_history[-1]
+        st.caption(f"Source: EIA (PET.RWTC.D). Latest: ${latest['price']:.2f} on {latest['date']}.")
+
+
+# --- News headlines: presented as-is, not scored ---------------------------
+st.divider()
+st.subheader("Recent Hormuz/Gulf shipping headlines")
+st.caption("For a quick sense of current coverage -- not weighted or scored, just a list.")
+
+headlines = get_cached_headlines()
+
+if not headlines:
+    st.write("No recent matching headlines found.")
 else:
-    status_color, status_text = "#2f855a", "STABLE"
+    for h in headlines:
+        date_display = h["date"][:8] if h.get("date") else "?"
+        st.write(f"**{h['source']}** ({date_display}) -- {h['title']}")
 
-vessel_display = breakdown["hormuz_live_vessel_count"] if breakdown["hormuz_live_vessel_count"] is not None else "N/A"
-price_display = price if price is not None else "N/A"
-risk_display = round(risk, 2) if risk is not None else "N/A"
 
-st.markdown(f"""
-<div style="background:#0d1117; padding:24px; border-radius:12px; font-family:sans-serif; color:white;">
-  <div style="display:flex; justify-content:space-around; text-align:center;">
-    <div>
-      <div style="color:#9aa5b1; font-size:0.85em;">Hormuz Live Vessel Count (spot check, not scored)</div>
-      <div style="font-size:2.2em; font-weight:700;">{vessel_display}</div>
-    </div>
-    <div>
-      <div style="color:#9aa5b1; font-size:0.85em;">Oil Price</div>
-      <div style="font-size:2.2em; font-weight:700;">{price_display}</div>
-    </div>
-    <div>
-      <div style="color:#9aa5b1; font-size:0.85em;">Risk Score</div>
-      <div style="font-size:2.2em; font-weight:700;">{risk_display}</div>
-    </div>
-  </div>
-  <div style="background:{status_color}; margin-top:20px; padding:12px; border-radius:8px; text-align:center; font-weight:600;">
-    {status_text}
-  </div>
-</div>
-""", unsafe_allow_html=True)
-
-with st.expander("Shipping stress breakdown", expanded=True):
-    st.write(f"**Combined shipping stress:** "
-             f"{round(stress, 1) if stress is not None else 'N/A'}")
-    st.write(f"- Hormuz transit (live, IMF PortWatch): "
-             f"{round(breakdown['hormuz_transit_score'], 1) if breakdown['hormuz_transit_score'] is not None else 'N/A'}")
-    if breakdown.get("hormuz_transit_latest") is not None:
-        st.caption(
-            f"  Latest tanker transits: {breakdown['hormuz_transit_latest']} "
-            f"vs baseline {breakdown['hormuz_transit_baseline']} "
-            f"({breakdown['hormuz_transit_pct_change']:+.1f}%)"
-        )
-    st.write(f"- News signal (GDELT, Hormuz/Gulf disruption coverage): "
-             f"{round(breakdown['news_score'], 1) if breakdown['news_score'] is not None else 'N/A'}")
-    st.caption(
-        "PortWatch data has a ~7 day publication lag and is cached up to "
-        "6 hours. News signal updates roughly every 30 minutes. Freight "
-        "rate and Suez transit were dropped from this score in the "
-        "redesign -- see shipping_stress.py for the current weighting."
-    )
-
+# --- Polymarket: a market-priced probability, presented as-is --------------
 st.divider()
-st.subheader("Iran/Gulf Prediction Market Signal (Polymarket, not scored)")
+st.subheader("Iran/Gulf prediction market pricing (Polymarket)")
 
 polymarket_matches = get_cached_polymarket()
 
@@ -276,7 +385,4 @@ else:
             use_container_width=True,
         )
 
-st.caption(
-    "Source: Polymarket Gamma API. Market-priced probability, not a "
-    "stress score -- kept separate from Risk Score."
-)
+st.caption("Source: Polymarket Gamma API. A market-priced probability, not a fact.")
